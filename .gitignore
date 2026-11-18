@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+report.xml
+image.tar
+.env
+.idea/
+.vscode/
+
+# Frontend (Next.js)
+node_modules/
+.next/
+out/
+next-env.d.ts
+*.tsbuildinfo
+.cache/

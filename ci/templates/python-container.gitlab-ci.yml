@@ -1,0 +1,181 @@
+# Reusable pipeline: test a Python backend (and optional Node frontend), build one
+# container image, push it to Nexus.
+#
+# Stages
+#   test     - ruff lint + pytest; frontend type check + build if FRONTEND_DIR has a
+#              package-lock.json (every pipeline)
+#   build    - docker build, image saved as a job artifact (every pipeline)
+#   publish  - load that same image, tag it, push to Nexus (default branch and tags only)
+#
+# Building once and pushing the saved image means what was tested is exactly what ships,
+# and merge requests never push to Nexus.
+#
+# ---------------------------------------------------------------------------------------
+# Variables
+#
+# Set in the project's .gitlab-ci.yml:
+#   IMAGE_NAME          image name in Nexus, e.g. "orders-api" or "my-team/orders-api"
+#   BACKEND_DIR         folder with requirements-dev.txt and tests (default "backend")
+#   FRONTEND_DIR        folder with package.json/package-lock.json (default "frontend");
+#                       the frontend job is skipped if it has no package-lock.json
+#
+# Set as CI/CD variables in GitLab, ideally once at GROUP level so every project
+# inherits them (Settings > CI/CD > Variables). Values set there override the
+# defaults below.
+#   NEXUS_REGISTRY      Nexus docker connector host:port for pushes, e.g. nexus.corp:8443
+#                       (this is the hosted repo's connector, not the Nexus UI URL)
+#   NEXUS_USERNAME      service account with push rights
+#   NEXUS_PASSWORD      masked + protected
+#   BASE_REGISTRY       where base images are pulled from (Nexus docker-proxy/group)
+#   PIP_INDEX_URL       Nexus pypi-proxy simple index, e.g. https://nexus.corp/repository/pypi/simple
+#   NPM_REGISTRY        Nexus npm-proxy URL, e.g. https://nexus.corp/repository/npm-all/
+# ---------------------------------------------------------------------------------------
+
+stages:
+  - test
+  - build
+  - publish
+
+variables:
+  BACKEND_DIR: backend
+  FRONTEND_DIR: frontend
+  BASE_REGISTRY: docker.io
+  PIP_INDEX_URL: https://pypi.org/simple
+  NPM_REGISTRY: https://registry.npmjs.org
+  PYTHON_IMAGE: ${BASE_REGISTRY}/library/python:3.12-slim
+  NODE_IMAGE: ${BASE_REGISTRY}/library/node:24-alpine
+  DOCKER_IMAGE: ${BASE_REGISTRY}/library/docker:28
+  DOCKER_DIND_IMAGE: ${BASE_REGISTRY}/library/docker:28-dind
+
+# Run for merge requests, branches without an open MR, and tags. Avoids duplicate
+# branch + MR pipelines for the same commit.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+# ---------------------------------------------------------------------------------------
+# Shared job settings
+# ---------------------------------------------------------------------------------------
+
+# Docker-in-Docker. Needs a runner with privileged = true. For the Docker executor the
+# runner's config.toml also needs volumes = ["/certs/client", "/cache"].
+# If privileged runners are not allowed, see "No privileged runners" in the README.
+.docker:
+  image: ${DOCKER_IMAGE}
+  services:
+    - name: ${DOCKER_DIND_IMAGE}
+      alias: docker
+      # Only for a Nexus served over plain HTTP:
+      # command: ["--insecure-registry=${NEXUS_REGISTRY}"]
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: /certs
+    DOCKER_TLS_VERIFY: 1
+    DOCKER_CERT_PATH: /certs/client
+
+# ---------------------------------------------------------------------------------------
+# test
+# ---------------------------------------------------------------------------------------
+
+test:backend:
+  stage: test
+  image: ${PYTHON_IMAGE}
+  interruptible: true
+  variables:
+    PIP_CACHE_DIR: ${CI_PROJECT_DIR}/.cache/pip
+  cache:
+    key: pip-${BACKEND_DIR}
+    paths:
+      - .cache/pip
+  script:
+    - cd "${BACKEND_DIR}"
+    - pip install --index-url "${PIP_INDEX_URL}" -r requirements-dev.txt
+    - ruff check .
+    - pytest --junitxml=report.xml
+  artifacts:
+    when: always
+    expire_in: 1 week
+    reports:
+      junit: ${BACKEND_DIR}/report.xml
+
+# Type-checks and builds the frontend so errors show up here rather than halfway through
+# docker build. The Dockerfile builds it again for the image; this job's output is not reused.
+test:frontend:
+  stage: test
+  image: ${NODE_IMAGE}
+  interruptible: true
+  rules:
+    - exists:
+        - ${FRONTEND_DIR}/package-lock.json
+  variables:
+    npm_config_registry: ${NPM_REGISTRY}
+    npm_config_cache: ${CI_PROJECT_DIR}/.cache/npm
+    NEXT_TELEMETRY_DISABLED: "1"
+  cache:
+    key:
+      files:
+        - ${FRONTEND_DIR}/package-lock.json
+      prefix: npm
+    paths:
+      - .cache/npm
+  script:
+    - cd "${FRONTEND_DIR}"
+    - npm ci --no-audit --no-fund
+    - npm run typecheck
+    - npm run build
+
+# ---------------------------------------------------------------------------------------
+# build
+# ---------------------------------------------------------------------------------------
+
+build:image:
+  stage: build
+  extends: .docker
+  interruptible: true
+  needs:
+    - job: test:backend
+    - job: test:frontend
+      optional: true
+  script:
+    - APP_VERSION="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+    - >
+      docker build
+      --build-arg BASE_REGISTRY="${BASE_REGISTRY}"
+      --build-arg NPM_REGISTRY="${NPM_REGISTRY}"
+      --build-arg PIP_INDEX_URL="${PIP_INDEX_URL}"
+      --build-arg APP_VERSION="${APP_VERSION}"
+      --label org.opencontainers.image.source="${CI_PROJECT_URL}"
+      --label org.opencontainers.image.revision="${CI_COMMIT_SHA}"
+      --label org.opencontainers.image.version="${APP_VERSION}"
+      --tag "${IMAGE_NAME}:build"
+      .
+    - docker save "${IMAGE_NAME}:build" | gzip > image.tar.gz
+  artifacts:
+    paths:
+      - image.tar.gz
+    expire_in: 1 day
+
+# ---------------------------------------------------------------------------------------
+# publish
+# ---------------------------------------------------------------------------------------
+
+publish:nexus:
+  stage: publish
+  extends: .docker
+  needs: [build:image]
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  variables:
+    IMAGE_REF: ${NEXUS_REGISTRY}/${IMAGE_NAME}
+  script:
+    # A git tag publishes <tag> (e.g. v1.2.0); the default branch publishes <short-sha>.
+    - IMAGE_TAG="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+    - docker load < image.tar.gz
+    - echo "$NEXUS_PASSWORD" | docker login "$NEXUS_REGISTRY" -u "$NEXUS_USERNAME" --password-stdin
+    - docker tag "${IMAGE_NAME}:build" "${IMAGE_REF}:${IMAGE_TAG}"
+    - docker push "${IMAGE_REF}:${IMAGE_TAG}"

@@ -1,0 +1,7 @@
+# Force LF everywhere. Files are built and run inside Linux containers and CI
+# runners, where CRLF line endings break shell scripts and Dockerfiles.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary

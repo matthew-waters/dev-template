@@ -1,0 +1,14 @@
+.git
+.gitlab-ci.yml
+ci/
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/.venv
+backend/tests
+*.md
+# Frontend: dependencies and build output are recreated inside the image.
+**/node_modules
+**/.next
+frontend/out
+**/*.tsbuildinfo

@@ -1,0 +1,12 @@
+# Local run: `docker compose up --build`, then open http://localhost:8000
+services:
+  app:
+    build:
+      context: .
+      args:
+        BASE_REGISTRY: ${BASE_REGISTRY:-docker.io}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        APP_VERSION: local
+    ports:
+      - "8000:8000"

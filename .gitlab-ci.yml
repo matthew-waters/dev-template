@@ -1,0 +1,18 @@
+# Project pipeline. All the logic lives in the shared template; a project only
+# says which template to use and sets its own image name.
+#
+# Here the template is in this repo (`local:`). At work, move the template into a
+# central project (e.g. my-group/ci-templates) and include it like this instead:
+#
+#   include:
+#     - project: my-group/ci-templates
+#       ref: main
+#       file: templates/python-container.gitlab-ci.yml
+
+include:
+  - local: ci/templates/python-container.gitlab-ci.yml
+
+variables:
+  IMAGE_NAME: devworkflow-example
+  BACKEND_DIR: backend
+  FRONTEND_DIR: frontend
